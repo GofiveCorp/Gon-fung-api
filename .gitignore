@@ -1,0 +1,59 @@
+# --- Node / TypeScript ---
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# --- Test & Coverage ---
+coverage/
+.nyc_output/
+jest-*.tmp/
+
+# --- Playwright ---
+playwright-report/
+blob-report/
+test-results/
+.playwright/
+.pw-*
+
+# --- Runtime data (ใหญ่/ชั่วคราว) ---
+recordings/
+data/
+sandbox/
+tmp/
+logs/
+*.log
+*.pid
+*.seed
+*.tgz
+
+# --- Env & Secrets (เก็บตัวอย่างไว้แทน) ---
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.crt
+*.p12
+bot.config.json
+!bot.config.example.json
+
+# --- Python & Notebooks (มีไฟล์ทดสอบอยู่) ---
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Docker (ถ้ามีไฟล์ชั่วคราว) ---
+docker-volumes/
+*.local.env

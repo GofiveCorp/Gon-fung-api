@@ -1,0 +1,1000 @@
+#!/bin/bash
+
+# Meet Teams Bot - Serverless Runner
+# This script provides an easy way to run the bot in serverless mode
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Emoji icons
+ICON_INFO="ℹ️"
+ICON_SUCCESS="✅"
+ICON_WARNING="⚠️"
+ICON_ERROR="❌"
+ICON_FILE="📁"
+ICON_BOT="🤖"
+ICON_DISPLAY="🖥️"
+
+print_info()    { echo -e "${BLUE}${ICON_INFO}  $1${NC}" >&2; }
+print_success() { echo -e "${GREEN}${ICON_SUCCESS} $1${NC}" >&2; }
+print_warning() { echo -e "${YELLOW}${ICON_WARNING}  $1${NC}" >&2; }
+print_error()   { echo -e "${RED}${ICON_ERROR} $1${NC}" >&2; }
+
+# Generate UUID
+generate_uuid() {
+    if command -v uuidgen &> /dev/null; then
+        uuidgen | tr '[:lower:]' '[:upper:]'
+    elif command -v python3 &> /dev/null; then
+        python3 -c "import uuid; print(str(uuid.uuid4()).upper())"
+    elif command -v node &> /dev/null; then
+        node -e "console.log(require('crypto').randomUUID().toUpperCase())"
+    else
+        # Fallback: generate a pseudo-UUID using date and random
+        date +%s | sha256sum | head -c 8 | tr '[:lower:]' '[:upper:]'
+        echo "-$(date +%N | head -c 4 | tr '[:lower:]' '[:upper:]')-$(date +%N | tail -c 4 | tr '[:lower:]' '[:upper:]')-$(shuf -i 1000-9999 -n 1)-$(shuf -i 100000000000-999999999999 -n 1)"
+    fi
+}
+
+# Check if Docker is available
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker is not installed or not in PATH"
+        print_info "Please install Docker: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+}
+
+# Build Docker image
+build_image() {
+    local image_name=${1:-meet-teams-bot}
+    local date_tag
+    date_tag=$(date +%Y%m%d-%H%M)
+    local full_tag="${image_name}:${date_tag}"
+    
+    print_info "Building Meet Teams Bot Docker image..."
+    print_info "Tagging as: ${full_tag}"
+    docker build -t "${full_tag}" .
+    print_success "Docker image built successfully: ${full_tag}"
+    
+    # Also tag as latest for convenience
+    docker tag "${full_tag}" "${image_name}:latest"
+    print_info "Also tagged as: ${image_name}:latest"
+    
+    # Update the image name for the rest of the script
+    export DOCKER_IMAGE_NAME="${full_tag}"
+}
+
+# Create output directory
+create_output_dir() {
+    local output_dir="./recordings"
+    mkdir -p "$output_dir"
+    echo "$output_dir"
+}
+
+# Get the current Docker image name
+get_docker_image() {
+    local image_name=${DOCKER_IMAGE_NAME:-meet-teams-bot:latest}
+    echo "$image_name"
+}
+
+# Find available port
+find_available_port() {
+    local start_port=${1:-3000}
+    local port=$start_port
+    while lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; do
+        if [ "$port" -ge 65535 ]; then
+            print_error "No free TCP port found below 65535"
+            return 1
+        fi
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+# Mask sensitive information in JSON
+mask_sensitive_json() {
+    local json=$1
+    # Mask API keys, tokens, and other sensitive fields
+    echo "$json" | sed -E 's/("(api_key|token|secret|password|webhook|key)"[[:space:]]*:[[:space:]]*")[^"]*/\1********/g'
+}
+
+# Apply CLI overrides to JSON configuration (robust)
+apply_overrides() {
+    local json="$1"; shift
+    local overrides=("$@")
+    for override in "${overrides[@]}"; do
+        if [[ "$override" == *"="* ]]; then
+            local key="${override%%=*}"
+            local value="${override#*=}"
+            if command -v jq &> /dev/null; then
+                # เช็คด้วย jq จริง ๆ ว่า value เป็น JSON valid ไหม
+                if echo "$value" | jq -e . >/dev/null 2>&1; then
+                    # เป็น JSON (ตัวเลข/boolean/null/[]/{}/ฯลฯ)
+                    json=$(echo "$json" | jq --arg k "$key" --argjson v "$value" '.[$k] = $v')
+                else
+                    # ไม่ใช่ JSON → เก็บเป็นสตริง
+                    json=$(echo "$json" | jq --arg k "$key" --arg v "$value" '.[$k] = $v')
+                fi
+            else
+                print_warning "jq not available, skipping override: $override"
+            fi
+        else
+            print_warning "Invalid override format: $override (must be key=value)"
+        fi
+    done
+    echo "$json"
+}
+
+
+process_config() {
+  local config_json="$1"
+  local gen_uuid
+  gen_uuid=$(generate_uuid)
+  print_info "${ICON_BOT} Using session ID (prefer incoming, else fallback): ${gen_uuid:0:8}..."
+
+  if command -v jq &> /dev/null; then
+    # bot_uuid = (bot_uuid || id || gen), id = (id || bot_uuid)
+    echo "$config_json" | jq --arg gen "$gen_uuid" '
+      .bot_uuid = (.bot_uuid // .id // $gen) |
+      .id       = (.id // .bot_uuid)
+    '
+  else
+    # sed fallback: เติมเฉพาะที่ “ยังไม่มี” หลีกเลี่ยงการเขียนทับ
+    local out="$config_json"
+
+    # ถ้ายังไม่มี bot_uuid → ใช้ id ถ้ามี ไม่งั้นใช้ gen
+    if ! echo "$out" | grep -q '"bot_uuid"[[:space:]]*:'; then
+      local cur_id
+      cur_id="$(echo "$out" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+      local use="${cur_id:-$gen_uuid}"
+      local trimmed="$(echo "$out" | sed -E 's/[[:space:]]*\}[[:space:]]*$//')"
+      out="${trimmed}, \"bot_uuid\": \"${use}\"}"
+    fi
+
+    # ถ้ายังไม่มี id → ใช้ bot_uuid ที่มีอยู่ (หรือ gen ถ้าไม่เจอ)
+    if ! echo "$out" | grep -q '"id"[[:space:]]*:'; then
+      local cur_bu
+      cur_bu="$(echo "$out" | sed -n 's/.*"bot_uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+      local use="${cur_bu:-$gen_uuid}"
+      local trimmed2="$(echo "$out" | sed -E 's/[[:space:]]*\}[[:space:]]*$//')"
+      out="${trimmed2}, \"id\": \"${use}\"}"
+    fi
+
+    echo "$out"
+  fi
+}
+
+
+# Run bot with configuration file
+run_with_config() {
+    local config_file=$1
+    local override_meeting_url=$2
+    local recording_mode=${RECORDING:-true}  # Par défaut true
+    local debug_mode=${DEBUG:-false}  # Debug mode avec VNC
+    local debug_logs=${DEBUG_LOGS:-false}  # Debug logs mode
+    
+    if [ ! -f "$config_file" ]; then
+        print_error "Configuration file '$config_file' not found"
+        print_info "Please create a JSON configuration file. See params.json for example format."
+        exit 1
+    fi
+    
+    local output_dir=$(create_output_dir)
+    local config_json=$(cat "$config_file")
+        # ถ้าไฟล์ว่าง ให้เริ่มจาก {} เพื่อให้ process_config ทำงานได้
+    if [ -z "$(echo "$config_json" | tr -d ' \t\r\n')" ]; then
+        config_json="{}"
+    fi
+
+    
+    # Override meeting URL if provided as argument
+    if [ -n "$override_meeting_url" ]; then
+        print_info "Overriding meeting URL with: $override_meeting_url"
+        # Use jq if available, otherwise use sed
+        if command -v jq &> /dev/null; then
+            config_json=$(echo "$config_json" | jq --arg url "$override_meeting_url" '.meeting_url = $url')
+        else
+            print_error "jq not available, cannot override meeting URL"
+            exit 1
+        fi
+    fi
+    
+    local processed_config=$(process_config "$config_json")
+
+    # ... หลังจากมีบรรทัด: local processed_config=$(process_config "$config_json") หรือ "$json_input"
+
+    # ดึง bot_uuid ออกมาแบบไม่พึ่ง jq
+    local bot_uuid_val
+    bot_uuid_val="$(echo "$processed_config" | sed -n 's/.*"bot_uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -z "$bot_uuid_val" ] && bot_uuid_val="$(generate_uuid)"
+
+    cname="${bot_uuid_val}"
+    echo "::container_name::${cname}"  # <<== ให้ app.js เก็บชื่อไว้
+    print_info "bot UUID: ${bot_uuid_val}"
+
+    print_info "Running Meet Teams Bot with configuration: $config_file"
+    print_info "Recording enabled: $recording_mode"
+    print_info "Recording mode: screen (direct capture)"
+    if [ -n "$override_meeting_url" ]; then
+        print_info "Meeting URL: $override_meeting_url"
+    fi
+    print_info "Output directory: $output_dir"
+    
+    # Debug mode avec VNC
+    # ไม่ผูกพอร์ตโดยปริยาย → รันหลายตัวได้
+    local docker_args=""
+    # ถ้า DEBUG ค่อยเปิด และเลือกพอร์ตว่างอัตโนมัติ
+    if [ "$debug_mode" = "true" ]; then
+        local ui_port=${UI_PORT:-3000}
+        local vnc_port=${VNC_PORT:-5900}
+        ui_port=$(find_available_port "$ui_port")
+        vnc_port=$(find_available_port "$vnc_port")
+        docker_args="-p ${vnc_port}:5900 -p ${ui_port}:3000"
+        print_info "🔍 DEBUG: host ports → UI:${ui_port}, VNC:${vnc_port}"
+    fi
+    
+    # Debug: Show what we're sending to Docker (first 200 chars)
+    local preview=$(echo "$processed_config" | head -c 200)
+    print_info "Config preview: ${preview}..."
+    
+    # Validate JSON is not empty
+    if [ -z "$processed_config" ] || [ "$processed_config" = "{}" ]; then
+        print_error "Invalid configuration format after processing."
+        print_error "Original config_json: $config_json"
+        print_error "Processed config: $processed_config"
+        exit 1
+    fi
+    
+    # Extract bot_uuid for summary message
+    local bot_uuid
+    if command -v jq &> /dev/null; then
+        bot_uuid=$(echo "$processed_config" | jq -r '.bot_uuid // empty')
+    fi
+    
+    # Add debug logs environment variable if enabled
+    local debug_env=""
+    if [ "$debug_logs" = "true" ]; then
+        debug_env="-e DEBUG_LOGS=true"
+        print_info "🐛 DEBUG logs enabled - verbose speakers logging activated"
+    fi
+    
+    # Run the bot
+    # ตอน docker run ให้เพิ่ม --name และ label
+    printf '%s' "$processed_config" | docker run -i \
+        --init --stop-signal SIGTERM --stop-timeout 180 \
+        -p 0:8080 \
+        --add-host=host.docker.internal:host-gateway \
+        --name "${cname}" \
+        --label "meetbot=1" \
+        --label "meetbot.uuid=${bot_uuid_val}" \
+        -e RECORDING="$recording_mode" \
+        $debug_env \
+        $docker_args \
+        -v "$(pwd)/$output_dir:/app/data" \
+        -e HOST=0.0.0.0 -e BIND_HOST=0.0.0.0 -e PORT=8080 \
+        "$(get_docker_image)" 2>&1 | while IFS= read -r line; do
+    if [[ $line == *"Starting virtual display"* ]]; then
+        print_info "${ICON_DISPLAY} $line"
+    elif [[ $line == *"Virtual display started"* ]]; then
+        print_success "$line"
+    else
+        echo "$line"
+    fi
+    done
+    
+    # Check if the last command was successful
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        print_success "Bot session completed successfully"
+        # List generated files with better formatting
+        if [ -d "$output_dir" ] && [ "$(ls -A $output_dir)" ]; then
+            echo
+            print_success "Generated recordings:"
+            find "$output_dir" -type f \( -name "*.mp4" -o -name "*.wav" \) -print0 | while IFS= read -r -d '' file; do
+                size=$(du -h "$file" | cut -f1)
+                filename=$(basename "$file")
+                echo -e "  ${GREEN}${ICON_FILE} $filename${NC} (${size})"
+            done
+        fi
+        if [ -n "$bot_uuid" ]; then
+            echo -e "\n${GREEN}done, check out your recording and metadata for bot UUID in $bot_uuid${NC}"
+            echo
+            echo "./recordings/$bot_uuid/output.mp4"
+            echo "./recordings/$bot_uuid/"  # folder for metadata and all files
+        fi
+    else
+        print_error "Bot session failed"
+        exit 1
+    fi
+}
+
+# Run bot with configuration file and CLI overrides
+run_with_config_and_overrides() {
+    local config_file=$1
+    shift
+    local overrides=("$@")
+    local config_json
+    config_json=$(cat "$config_file")
+
+        # ถ้าไฟล์ว่าง ให้เริ่มจาก {} แล้วค่อย apply_overrides (meeting_url=... ฯลฯ)
+    if [ -z "$(echo "$config_json" | tr -d ' \t\r\n')" ]; then
+        config_json="{}"
+    fi
+
+    
+    if [ ${#overrides[@]} -gt 0 ]; then
+        config_json=$(apply_overrides "$config_json" "${overrides[@]}")
+        print_info "Applied CLI overrides: ${overrides[*]}"
+    fi
+    
+    local output_dir=$(create_output_dir)
+    local processed_config=$(process_config "$config_json")
+    local recording_mode=${RECORDING:-true}
+    local debug_mode=${DEBUG:-false}
+    local debug_logs=${DEBUG_LOGS:-false}
+
+    # ดึง bot_uuid ออกมาแบบไม่พึ่ง jq
+    local bot_uuid_val
+    bot_uuid_val="$(echo "$processed_config" | sed -n 's/.*"bot_uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -z "$bot_uuid_val" ] && bot_uuid_val="$(generate_uuid)"
+
+    cname="${bot_uuid_val}"
+    echo "::container_name::${cname}"  # <<== ให้ app.js เก็บชื่อไว้
+    print_info "bot UUID: ${bot_uuid_val}"
+    
+    print_info "Running Meet Teams Bot with configuration: $config_file"
+    print_info "Recording enabled: $recording_mode"
+    print_info "Recording mode: screen (direct capture)"
+    print_info "Output directory: $output_dir"
+    
+    # ไม่ผูกพอร์ตโดยปริยาย → รันหลายตัวได้
+    local docker_args=""
+    # ถ้า DEBUG ค่อยเปิด และเลือกพอร์ตว่างอัตโนมัติ
+    if [ "$debug_mode" = "true" ]; then
+        local ui_port=${UI_PORT:-3000}
+        local vnc_port=${VNC_PORT:-5900}
+        ui_port=$(find_available_port "$ui_port")
+        vnc_port=$(find_available_port "$vnc_port")
+        docker_args="-p ${vnc_port}:5900 -p ${ui_port}:3000"
+        print_info "🔍 DEBUG: host ports → UI:${ui_port}, VNC:${vnc_port}"
+    fi
+    
+    # Debug: Show what we're sending to Docker (first 200 chars)
+    local preview=$(echo "$processed_config" | head -c 200)
+    print_info "Config preview: ${preview}..."
+    
+    # Validate JSON is not empty
+    if [ -z "$processed_config" ] || [ "$processed_config" = "{}" ]; then
+        print_error "Invalid configuration format after processing."
+        print_error "Original config_json: $config_json"
+        print_error "Processed config: $processed_config"
+        exit 1
+    fi
+    
+    # Extract bot_uuid for summary message
+    local bot_uuid
+    if command -v jq &> /dev/null; then
+        bot_uuid=$(echo "$processed_config" | jq -r '.bot_uuid // empty')
+    fi
+    
+    # Add debug logs environment variable if enabled
+    local debug_env=""
+    if [ "$debug_logs" = "true" ]; then
+        debug_env="-e DEBUG_LOGS=true"
+        print_info "🐛 DEBUG logs enabled - verbose speakers logging activated"
+    fi
+    
+    # ตอน docker run ให้เพิ่ม --name และ label
+    printf '%s' "$processed_config" | docker run -i \
+        --init --stop-signal SIGTERM --stop-timeout 180 \
+        -p 0:8080 \
+        --add-host=host.docker.internal:host-gateway \
+        --name "${cname}" \
+        --label "meetbot=1" \
+        --label "meetbot.uuid=${bot_uuid_val}" \
+        -e RECORDING="$recording_mode" \
+        $debug_env \
+        $docker_args \
+        -v "$(pwd)/$output_dir:/app/data" \
+        -e HOST=0.0.0.0 -e BIND_HOST=0.0.0.0 -e PORT=8080 \
+        "$(get_docker_image)" 2>&1 | while IFS= read -r line; do
+    if [[ $line == *"Starting virtual display"* ]]; then
+        print_info "${ICON_DISPLAY} $line"
+    elif [[ $line == *"Virtual display started"* ]]; then
+        print_success "$line"
+    else
+        echo "$line"
+    fi
+    done
+    
+    # Check if the last command was successful
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        print_success "Bot session completed successfully"
+        # List generated files with better formatting
+        if [ -d "$output_dir" ] && [ "$(ls -A $output_dir)" ]; then
+            echo
+            print_success "Generated recordings:"
+            find "$output_dir" -type f \( -name "*.mp4" -o -name "*.wav" \) -print0 | while IFS= read -r -d '' file; do
+                size=$(du -h "$file" | cut -f1)
+                filename=$(basename "$file")
+                echo -e "  ${GREEN}${ICON_FILE} $filename${NC} (${size})"
+            done
+        fi
+        if [ -n "$bot_uuid" ]; then
+            echo -e "\n${GREEN}done, check out your recording and metadata for bot UUID in $bot_uuid${NC}"
+            echo
+            echo "./recordings/$bot_uuid/output.mp4"
+            echo "./recordings/$bot_uuid/"  # folder for metadata and all files
+        fi
+    else
+        print_error "Bot session failed"
+        exit 1
+    fi
+}
+
+# Run bot in debug mode (enables debug logs + VNC)
+run_debug() {
+    local config_file=$1
+    local override_meeting_url=$2
+    
+    print_info "🐛 Starting DEBUG mode - speakers debug logs + VNC enabled"
+    
+    # Force enable debug modes
+    export DEBUG_LOGS=true
+    export DEBUG=true
+    
+    # Call the regular run function with debug enabled
+    run_with_config "$config_file" "$override_meeting_url"
+}
+
+# Run bot with JSON input
+run_with_json() {
+    local json_input=$1
+    local recording_mode=${RECORDING:-true}  # Par défaut true
+    local debug_mode=${DEBUG:-false}  # Debug mode avec VNC
+    local debug_logs=${DEBUG_LOGS:-false}  # Debug logs mode
+    local output_dir=$(create_output_dir)
+    local processed_config=$(process_config "$json_input")
+
+    # ดึง bot_uuid ออกมาแบบไม่พึ่ง jq
+    local bot_uuid_val
+    bot_uuid_val="$(echo "$processed_config" | sed -n 's/.*"bot_uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -z "$bot_uuid_val" ] && bot_uuid_val="$(generate_uuid)"
+
+    cname="${bot_uuid_val}"
+    echo "::container_name::${cname}"  # <<== ให้ app.js เก็บชื่อไว้
+    print_info "bot UUID: ${bot_uuid_val}"
+    
+    print_info "Running Meet Teams Bot with provided JSON configuration"
+    print_info "Recording enabled: $recording_mode"
+    print_info "Recording mode: screen (direct capture)"
+    print_info "Output directory: $output_dir"
+    
+    # Debug mode avec VNC
+    # ไม่ผูกพอร์ตใด ๆ โดยปริยาย → รันพร้อมกันได้
+    local docker_args=""
+    # ถ้า DEBUG ค่อยเปิดพอร์ต และเลือกพอร์ตว่างอัตโนมัติ
+    if [ "$debug_mode" = "true" ]; then
+        local ui_port=${UI_PORT:-3000}
+        local vnc_port=${VNC_PORT:-5900}
+        ui_port=$(find_available_port "$ui_port")
+        vnc_port=$(find_available_port "$vnc_port")
+        docker_args="-p ${vnc_port}:5900 -p ${ui_port}:3000"
+        print_info "🔍 DEBUG: host ports → UI:${ui_port}, VNC:${vnc_port}"
+    fi
+
+    
+    # Debug: Show what we're sending to Docker (first 200 chars)
+    local preview=$(echo "$processed_config" | head -c 200)
+    print_info "Config preview: ${preview}..."
+    
+    # Validate JSON is not empty
+    if [ -z "$processed_config" ] || [ "$processed_config" = "{}" ]; then
+        print_error "Processed configuration is empty or invalid"
+        print_info "Original config: $json_input"
+        exit 1
+    fi
+    
+    # Add debug logs environment variable if enabled
+    local debug_env=""
+    if [ "$debug_logs" = "true" ]; then
+        debug_env="-e DEBUG_LOGS=true"
+        print_info "🐛 DEBUG logs enabled - verbose speakers logging activated"
+    fi
+    
+    # ตอน docker run ให้เพิ่ม --name และ label
+    printf '%s' "$processed_config" | docker run -i \
+        --init --stop-signal SIGTERM --stop-timeout 180 \
+        -p 0:8080 \
+        --add-host=host.docker.internal:host-gateway \
+        --name "${cname}" \
+        --label "meetbot=1" \
+        --label "meetbot.uuid=${bot_uuid_val}" \
+        -e RECORDING="$recording_mode" \
+        $debug_env \
+        $docker_args \
+        -v "$(pwd)/$output_dir:/app/data" \
+        -e HOST=0.0.0.0 -e BIND_HOST=0.0.0.0 -e PORT=8080 \
+        "$(get_docker_image)" 2>&1 | while IFS= read -r line; do
+    if [[ $line == *"Starting virtual display"* ]]; then
+        print_info "${ICON_DISPLAY} $line"
+    elif [[ $line == *"Virtual display started"* ]]; then
+        print_success "$line"
+    else
+        echo "$line"
+    fi
+    done
+    
+    print_success "Bot execution completed"
+    print_info "Recordings saved to: $output_dir"
+    
+    # List generated files
+    if [ -d "$output_dir" ] && [ "$(ls -A $output_dir)" ]; then
+        print_success "Generated files:"
+        find "$output_dir" -type f -name "*.mp4" -o -name "*.wav" | while read -r file; do
+            size=$(du -h "$file" | cut -f1)
+            echo -e "  ${GREEN}📁 $file${NC} (${size})"
+        done
+    fi
+}
+
+# Clean recordings directory
+clean_recordings() {
+    local output_dir="./recordings"
+    if [ -d "$output_dir" ]; then
+        print_warning "This will delete all files in $output_dir"
+        read -p "Are you sure? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$output_dir"/*
+            print_success "Recordings directory cleaned"
+        else
+            print_info "Operation cancelled"
+        fi
+    else
+        print_info "No recordings directory to clean"
+    fi
+}
+
+# Test recording system
+test_recording() {
+    local duration=${1:-30}  # Par défaut 30 secondes
+    local debug_mode=${DEBUG:-false}  # Debug mode avec VNC
+    
+    print_info "🧪 Testing screen recording system"
+    print_info "📅 Test duration: ${duration}s"
+    print_info "📄 Using normal run command with params.json"
+    if [ "$debug_mode" = "true" ]; then
+        print_info "🔍 DEBUG MODE: VNC will be available on port 5900"
+        print_info "💻 Connect with: open vnc://localhost:5900"
+    fi
+    
+    # Vérifier que Docker est disponible
+    check_docker
+    
+    # Vérifier que params.json existe
+    if [ ! -f "params.json" ]; then
+        print_error "params.json not found!"
+        print_info "Please create params.json with your meeting configuration"
+        return 1
+    fi
+    
+    # Construire l'image si nécessaire
+    if ! docker images | grep -q "$(get_docker_image | cut -d: -f1)"; then
+        print_info "Docker image not found, building..."
+        build_image
+    fi
+    
+    print_info "🚀 Starting normal bot run with screen recording..."
+    print_info "ℹ️ Will automatically stop after ${duration}s"
+    
+    # Créer un fichier temporaire pour les logs
+    local log_file="/tmp/test-run-$(date +%s).log"
+    
+    # Fonction pour timeout compatible macOS/Linux
+    run_with_timeout() {
+        local timeout_duration=$1
+        shift
+        
+        if command -v gtimeout &> /dev/null; then
+            # macOS avec coreutils installé
+            gtimeout "$timeout_duration" "$@"
+        elif command -v timeout &> /dev/null; then
+            # Linux
+            timeout "$timeout_duration" "$@"
+        else
+            # Fallback pour macOS sans coreutils
+            "$@" &
+            local pid=$!
+            (
+                sleep "$timeout_duration"
+                print_info "⏰ Test timeout reached (${timeout_duration}s), stopping..."
+                kill -TERM "$pid" 2>/dev/null
+                sleep 5
+                kill -KILL "$pid" 2>/dev/null
+            ) &
+            wait "$pid" 2>/dev/null
+        fi
+    }
+    
+    # Lancer la commande run normale avec timeout
+    local env_vars=""
+    if [ "$debug_mode" = "true" ]; then
+        env_vars="DEBUG=true"
+    fi
+    
+    if run_with_timeout $((duration + 10)) \
+        env $env_vars ./run_bot.sh run params.json > "$log_file" 2>&1; then
+        print_success "✅ Test completed successfully"
+    else
+        print_info "ℹ️ Test stopped after timeout (this is expected)"
+    fi
+    
+    # Analyser les logs
+    print_info "📊 Analyzing test results..."
+    
+    # Afficher les lignes clés des logs
+    print_info "🔍 Key system messages:"
+    grep -E "Virtual display|PulseAudio|audio devices|ScreenRecorder|Screen recording|Application|Bot execution|Generated files" "$log_file" | head -10 || true
+    
+    # Compter les succès
+    local success_count=0
+    local total_tests=5
+    
+    # Test 1: Virtual display
+    if grep -q "Virtual display started" "$log_file"; then
+        print_success "✅ Virtual display working"
+        ((success_count++))
+    else
+        print_warning "⚠️ Virtual display may have issues"
+    fi
+    
+    # Test 2: PulseAudio
+    if grep -q "PulseAudio started" "$log_file"; then
+        print_success "✅ PulseAudio working"
+        ((success_count++))
+    else
+        print_warning "⚠️ PulseAudio may have issues"
+    fi
+    
+    # Test 3: Virtual audio devices
+    if grep -q "Virtual audio devices created" "$log_file"; then
+        print_success "✅ Audio devices created"
+        ((success_count++))
+    else
+        print_warning "⚠️ Audio devices may have issues"
+    fi
+    
+    # Test 4: Application started
+    if grep -q "Starting application\|Running in serverless mode\|Running on http" "$log_file"; then
+        print_success "✅ Application started"
+        ((success_count++))
+    else
+        print_warning "⚠️ Application may not have started"
+    fi
+    
+    # Test 5: Configuration parsed
+    if ! grep -q "Failed to parse JSON from stdin" "$log_file"; then
+        print_success "✅ Configuration parsed successfully"
+        ((success_count++))
+    else
+        print_warning "⚠️ Configuration parsing failed"
+    fi
+    
+    # Vérifier les fichiers générés
+    local output_dir="./recordings"
+    if [ -d "$output_dir" ] && [ "$(find $output_dir -name "*.mp4" -o -name "*.wav" | wc -l)" -gt 0 ]; then
+        print_success "✅ Recording files were generated"
+        print_info "Generated files:"
+        find "$output_dir" -name "*.mp4" -o -name "*.wav" | head -5
+    else
+        print_info "ℹ️ No recording files (normal for short test)"
+    fi
+    
+    # Compter les erreurs critiques
+    local critical_errors=$(grep -i "error\|Error\|ERROR" "$log_file" | \
+        grep -v "Console logger\|redis url\|Failed to parse JSON\|info.*error\|redis.*undefined" | wc -l | tr -d ' ')
+    
+    if [ "$critical_errors" -eq 0 ]; then
+        print_success "✅ No critical errors detected"
+    else
+        print_warning "⚠️ $critical_errors critical error(s) found:"
+        grep -i "error\|Error\|ERROR" "$log_file" | \
+            grep -v "Console logger\|redis url\|Failed to parse JSON\|info.*error\|redis.*undefined" | head -3 || true
+    fi
+    
+    # Résumé final
+    local success_rate=$((success_count * 100 / total_tests))
+    print_success "🎯 Test completed for screen recording"
+    print_info "Duration: ${duration}s"
+    print_info "Success rate: $success_count/$total_tests tests passed ($success_rate%)"
+    print_info "Critical errors: $critical_errors"
+    print_info "Full log available at: $log_file"
+    
+    if [ "$success_rate" -ge 80 ] && [ "$critical_errors" -eq 0 ]; then
+        print_success "🎉 Test passed! Screen recording system is working correctly"
+        return 0
+    elif [ "$success_rate" -ge 60 ]; then
+        print_warning "⚠️ Test passed with warnings. System mostly working."
+        return 0
+    else
+        print_error "❌ Test failed. Multiple issues detected."
+        print_info "Check the full log for details: $log_file"
+        return 1
+    fi
+}
+
+# Test API request stop functionality
+test_api_request() {
+    print_info "🧪 Testing API request stop functionality"
+    print_info "🛑 Will send API stop request after 2 minutes"
+    
+    # Check if Docker is available
+    check_docker
+    
+    # Check if bot.config.json exists
+    if [ ! -f "bot.config.json" ]; then
+        print_error "bot.config.json not found!"
+        print_info "Please create bot.config.json with your meeting configuration"
+        return 1
+    fi
+    
+    # Build image if necessary
+    if ! docker images | grep -q "$(get_docker_image | cut -d: -f1)"; then
+        print_info "Docker image not found, building..."
+        build_image
+    fi
+    
+    local output_dir=$(create_output_dir)
+    local config_json=$(cat "bot.config.json")
+    local processed_config=$(process_config "$config_json")
+    
+    # Extract bot_uuid for API call
+    local bot_uuid
+    if command -v jq &> /dev/null; then
+        bot_uuid=$(echo "$processed_config" | jq -r '.bot_uuid // empty')
+    fi
+    
+    if [ -z "$bot_uuid" ]; then
+        print_error "Could not extract bot_uuid from configuration"
+        return 1
+    fi
+    
+    print_info "🤖 Bot UUID: ${bot_uuid:0:8}..."
+    print_info "🚀 Starting bot..."
+    
+    # Start the bot and capture logs
+    local log_file="/tmp/api-test-$(date +%s).log"
+    echo "$processed_config" | docker run -i \
+        -p 0:8080 \
+        --add-host=host.docker.internal:host-gateway \
+        -e RECORDING=true \
+        -v "$(pwd)/$output_dir:/app/data" \
+        "$(get_docker_image)" 2>&1 | tee "$log_file" &
+
+    local docker_pid=$!
+    
+    # Wait 2 minutes before sending API stop request
+    print_info "⏰ Waiting 2 minutes before sending API stop request..."
+    sleep 120
+    
+    # Send API stop request
+    print_info "🛑 Sending API stop request..."
+    local api_response
+    api_response=$(docker exec "$(docker ps -q --filter ancestor=$(get_docker_image))" curl -s -X POST http://localhost:8080/stop_record \
+        -H "Content-Type: application/json" \
+        -d "{\"bot_id\": \"$bot_uuid\"}")
+    
+    print_info "📡 API Response: $api_response"
+    
+    # Wait for cleanup to complete (up to 5 minutes)
+    print_info "⏳ Waiting for cleanup to complete (up to 5 minutes)..."
+    local cleanup_timeout=300
+    local cleanup_start=$(date +%s)
+    
+    while [ $(($(date +%s) - cleanup_start)) -lt $cleanup_timeout ]; do
+        if ! kill -0 $docker_pid 2>/dev/null; then
+            print_success "✅ Bot stopped successfully"
+            break
+        fi
+        sleep 5
+    done
+    
+    # Check if process is still running
+    if kill -0 $docker_pid 2>/dev/null; then
+        print_warning "⚠️ Bot still running after 5 minutes - merge/trim might still be in progress"
+        print_info "📊 Checking logs for merge progress..."
+        
+        # Show recent logs
+        print_info "🔍 Recent logs:"
+        tail -20 "$log_file" | while IFS= read -r line; do
+            if [[ $line == *"ScreenRecorder"* ]] || [[ $line == *"merge"* ]] || [[ $line == *"trim"* ]] || [[ $line == *"cleanup"* ]]; then
+                echo "  $line"
+            fi
+        done
+        
+        # Force stop after showing logs
+        print_info "🧹 Force stopping bot..."
+        kill -9 $docker_pid 2>/dev/null
+    else
+        print_success "✅ Bot stopped within expected time"
+    fi
+    
+    # Analyze results
+    print_info "📊 Analyzing test results..."
+    
+    # Check for merge/trim logs
+    if grep -q "Efficient sync and merge completed successfully" "$log_file"; then
+        print_success "✅ ScreenRecorder merge/trim completed successfully"
+    else
+        print_warning "⚠️ No merge/trim completion log found"
+    fi
+    
+    # Check for cleanup logs
+    if grep -q "Cleanup completed successfully" "$log_file"; then
+        print_success "✅ Cleanup completed successfully"
+    else
+        print_warning "⚠️ No cleanup completion log found"
+    fi
+    
+    # Check for API request handling
+    if grep -q "end meeting from api server" "$log_file"; then
+        print_success "✅ API request received and handled"
+    else
+        print_warning "⚠️ No API request handling log found"
+    fi
+    
+    # Check for generated files
+    local bot_files_dir="$output_dir/$bot_uuid"
+    if [ -d "$bot_files_dir" ] && [ "$(find "$bot_files_dir" -name "*.mp4" -o -name "*.wav" | wc -l)" -gt 0 ]; then
+        print_success "✅ Recording files were generated"
+    elif [ -d "$output_dir" ] && [ "$(find "$output_dir" -name "*.mp4" -o -name "*.wav" | wc -l)" -gt 0 ]; then
+        print_success "✅ Recording files were generated"
+    else
+        print_info "ℹ️ No recording files (normal for short test)"
+    fi
+    
+    print_success "🎯 API request test completed"
+    
+    # Show useful paths for the user
+    if [ -n "$bot_uuid" ]; then
+        echo -e "\n${GREEN} ✅ done, check out your recording and metadata for bot UUID in $bot_uuid${NC}"
+        echo
+        echo "./recordings/$bot_uuid/output.mp4"
+        echo "./recordings/$bot_uuid/"  # folder for metadata and all files
+    fi
+    
+    print_info "Full log available at: $log_file"
+    
+    # Cleanup
+    rm -f "$log_file"
+}
+
+# Show help
+show_help() {
+    echo -e "${BLUE}Meet Teams Bot - Serverless Runner${NC}"
+    echo
+    echo "Usage:"
+    echo "  $0 build                     - Build the Docker image"
+    echo "  $0 run <config_file> [url]   - Run bot with configuration file (optional meeting URL override)"
+    echo "  $0 debug <config_file> [url] - Run bot in DEBUG mode (speakers logs + VNC enabled)"
+    echo "  $0 run-json '<json>'         - Run bot with JSON configuration"
+    echo "  $0 test [duration]           - Test screen recording system (duration in seconds)"
+    echo "  $0 test-api-request              - Test API request stop functionality (2 minutes)"
+    echo "  $0 clean                     - Clean recordings directory"
+    echo "  $0 help                      - Show this help message"
+    echo
+    echo "Environment Variables:"
+    echo "  RECORDING=true|false         - Enable/disable video recording (default: true)"
+    echo "  DEBUG=true|false            - Enable/disable debug mode with VNC (default: false)"
+    echo "  DEBUG_LOGS=true|false       - Enable/disable speakers debug logs (default: false)"
+    echo
+    echo "Examples:"
+    echo "  $0 build"
+    echo "  $0 run params.json"
+    echo "  $0 debug params.json                            # Debug mode: speakers logs + VNC"
+    echo "  $0 run params.json 'https://meet.google.com/new-meeting-url'"
+    echo "  $0 debug params.json 'https://meet.google.com/new-url'  # Debug with URL override"
+    echo "  RECORDING=false $0 run params.json  # Run without video recording"
+    echo "  RECORDING=false $0 debug params.json  # Debug without video recording"
+    echo "  DEBUG=true $0 run params.json       # Run with VNC debug access only"
+    echo "  DEBUG_LOGS=true $0 run params.json  # Run with speakers debug logs only"
+    echo "  $0 run-json '{\"meeting_url\":\"https://meet.google.com/abc-def-ghi\", \"bot_name\":\"RecordingBot\"}'"
+    echo "  RECORDING=false $0 run-json '{...}'  # Run JSON config without recording"
+    echo "  DEBUG=true $0 run-json '{...}'      # Run JSON config with VNC debug"
+    echo "  $0 test 60  # Test screen recording for 60 seconds"
+    echo "  DEBUG=true $0 test 60              # Test with VNC debug access"
+    echo "  $0 test-api-request     # Test API request stop after 2 minutes"
+    echo "  $0 clean"
+    echo
+    echo "Recording Modes:"
+    echo "  • screen (default)    - Direct screen capture via FFmpeg (recommended)"
+    echo
+    echo "Features:"
+    echo "  • Automatically generates bot_uuid if not provided"
+    echo "  • Override meeting URL by passing it as last argument"
+    echo "  • Control video recording with RECORDING environment variable"
+    echo "  • DEBUG mode: One command to enable speakers debug logs + VNC access"
+    echo "  • Debug logs: Show detailed speakers detection (DEBUG_LOGS=true)"
+    echo "  • VNC access: View bot screen remotely (DEBUG=true) - localhost:5900"
+    echo "  • Test recording system with different modes"
+    echo "  • Saves recordings to ./recordings directory (when recording enabled)"
+    echo "  • Lists generated files after completion"
+    echo
+    echo "For configuration format, see bot.config.json"
+}
+
+# Main script logic
+main() {
+    case "${1:-}" in
+        "build")
+            check_docker
+            build_image
+            ;;
+        "run")
+            local default_config="bot.config.json"
+            shift # remove 'run'
+            # If first arg is a file, use it as config, else use default
+            local config_file="$default_config"
+            local overrides=()
+            if [ -n "${1:-}" ] && [ -f "${1}" ]; then
+                config_file="$1"
+                shift
+            fi
+            # All remaining args are key=value overrides
+            while [ -n "${1:-}" ]; do
+                overrides+=("$1")
+                shift
+            done
+            if [ ! -f "$config_file" ]; then
+                print_error "Configuration file not found: $config_file"
+                print_info "Please create $config_file or specify a config file."
+                exit 1
+            fi
+            print_info "Using config file: $config_file"
+            run_with_config_and_overrides "$config_file" "${overrides[@]}"
+            ;;
+        "debug")
+            if [ -z "${2:-}" ]; then
+                print_error "Please specify a configuration file"
+                print_info "Usage: $0 debug <config_file> [meeting_url]"
+                exit 1
+            fi
+            check_docker
+            run_debug "$2" "$3"
+            ;;
+        "run-json")
+            if [ -z "${2:-}" ]; then
+                print_error "Please provide JSON configuration"
+                print_info "Usage: $0 run-json '<json_config>'"
+                exit 1
+            fi
+            check_docker
+            run_with_json "$2"
+            ;;
+        "test")
+            test_recording "${2:-30}"
+            ;;
+        "test-api-request")
+            test_api_request
+            ;;
+        "clean")
+            clean_recordings
+            ;;
+        "help"|"-h"|"--help"|"")
+            show_help
+            ;;
+        *)
+            print_error "Unknown command: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@" 
