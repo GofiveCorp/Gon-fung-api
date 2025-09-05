@@ -13,6 +13,9 @@ import http from "http";
 import https from "https";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner"; 
+import BullMQ from "bullmq";
+const { Queue, Worker, QueueEvents } = BullMQ;
+import IORedis from "ioredis";
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -63,6 +66,27 @@ const axiosBot = axios.create({
   timeout: 7000,
   httpAgent: new http.Agent({ keepAlive: false }),
   httpsAgent: new https.Agent({ keepAlive: false })
+});
+
+// Redis / Queue
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const SCHED_QUEUE = process.env.SCHED_QUEUE || "container-scheduler";
+const SCHED_CONCURRENCY = Number(process.env.SCHED_CONCURRENCY || 2);
+
+// ✅ สำคัญ: ใส่ maxRetriesPerRequest: null (แนะนำปิด ready check ด้วย)
+const redisConn = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+const schedQueue = new Queue(process.env.SCHED_QUEUE || "container-scheduler", { connection: redisConn });
+const schedEvents = new QueueEvents(process.env.SCHED_QUEUE || "container-scheduler", { connection: redisConn });
+
+// axios ไปเรียกตัวเอง (ยิง /jobs ตอนถึงเวลา)
+const axiosSelf = axios.create({
+  baseURL: `http://127.0.0.1:${PORT}`,
+  timeout: 10000,
+  httpAgent: new http.Agent({ keepAlive: false }),
+  httpsAgent: new https.Agent({ keepAlive: false }),
 });
 
 // ===== Utils =====
@@ -314,6 +338,76 @@ function validateUuid(u) {
   if (!u || !/^[A-F0-9-]{36}$/i.test(String(u))) throw new Error("uuid รูปแบบไม่ถูกต้อง");
 }
 
+// ตัวช่วย parse "1h30m" → ms
+function parseAfterToMs(s) {
+  if (!s || typeof s !== "string") return null;
+  const re = /(\d+)\s*([smhd])/gi;
+  let ms = 0, m;
+  while ((m = re.exec(s))) {
+    const v = Number(m[1]), u = m[2].toLowerCase();
+    if (u === "s") ms += v * 1000;
+    else if (u === "m") ms += v * 60_000;
+    else if (u === "h") ms += v * 60 * 60_000;
+    else if (u === "d") ms += v * 24 * 60 * 60_000;
+  }
+  return ms || null;
+}
+
+// Worker: ถึงเวลา → เรียก /jobs เพื่อสร้างคอนเทนเนอร์ (one-shot)
+const launchWorker = new Worker(
+  process.env.SCHED_QUEUE || "container-scheduler",
+  async (job) => {
+    const { meeting_url, bot_name, extra } = job.data || {};
+    const r = await axiosSelf.post(
+      "/jobs",
+      { meeting_url, bot_name, extra },
+      {
+        headers: {
+          "X-API-Key": API_KEY,
+          "X-Queue-Job-Id": job.id,   // ✅ ส่ง id จากคิวเข้ามา
+        },
+      }
+    );
+    return r.data;
+  },
+  { connection: redisConn, concurrency: Number(process.env.SCHED_CONCURRENCY || 2) }
+);
+
+
+// Log คร่าว ๆ (ไม่บังคับ)
+schedEvents.on("completed", ({ jobId }) => console.log(`[schedule] completed jobId=${jobId}`));
+schedEvents.on("failed", ({ jobId, failedReason }) => console.warn(`[schedule] failed jobId=${jobId} reason=${failedReason}`));
+
+// ===== Helpers for queue status =====
+function computeNextRunAt(job) {
+  if (typeof job?.opts?.delay === "number") {
+    const ts = (job.timestamp || Date.now()) + job.opts.delay;
+    return new Date(ts).toISOString();
+  }
+  return null;
+}
+
+async function serializeJob(job) {
+  if (!job) return null;
+  const state = await job.getState(); // delayed|waiting|active|completed|failed|paused
+  const next_run_at = computeNextRunAt(job);
+  return {
+    id: job.id,
+    state,
+    queued: state === "delayed" || state === "waiting",
+    next_run_at,
+    name: job.name,
+    data: job.data,
+    attempts_made: job.attemptsMade,
+    opts: { delay: job.opts.delay, attempts: job.opts.attempts, backoff: job.opts.backoff },
+    returnvalue: job.returnvalue,
+    failedReason: job.failedReason,
+    created_at: new Date(job.timestamp).toISOString(),
+    processed_on: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+    finished_on: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+  };
+}
+
 // ===== App =====
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -341,12 +435,25 @@ app.post("/jobs", async (req, res) => {
     return res.status(500).json({ success: false, error: `run script not found: ${runPath}`, tried });
   }
 
-  const id = newJobId();
+  // ✅ ถ้ามาจากคิว จะมี X-Queue-Job-Id → ใช้เป็น id เดียวกับคิว
+  const queueJobId = req.header("X-Queue-Job-Id");
+  let id = queueJobId || newJobId();
+
+  // ตรวจความถูกต้องเมื่อเป็น id ที่รับมา (ต้องเป็น UUID และยังไม่ชน)
+  if (queueJobId) {
+    try { validateUuid(id); }
+    catch {
+      return res.status(400).json({ success: false, error: "invalid_job_id", detail: "must be UUID format" });
+    }
+    if (JOBS.has(id)) {
+      return res.status(409).json({ success: false, error: "job_id_already_exists" });
+    }
+  }
 
   const apiBase =
-  process.env.API_SERVER_BASEURL ||
-  process.env.WRAPPER_BASEURL ||
-  `http://host.docker.internal:${PORT}`;
+    process.env.API_SERVER_BASEURL ||
+    process.env.WRAPPER_BASEURL ||
+    `http://host.docker.internal:${PORT}`;
 
   const apiToken = process.env.API_SERVER_TOKEN || API_KEY;
 
@@ -360,16 +467,13 @@ app.post("/jobs", async (req, res) => {
     "run",
     `meeting_url=${meeting_url}`,
     `bot_uuid=${id}`,
-    // (ถ้าบอทต้องการคีย์บนสุดด้วย คงไว้ได้ ไม่เสียหาย)
     `api_server_baseurl=${apiBase}`,
     `api_server_token=${apiToken}`,
-    // ใส่ remote เป็น JSON ทั้งก้อน (ไม่มีช่องว่าง)
     `remote=${JSON.stringify(remoteOverride)}`,
   ];
 
   if (bot_name) args.push(`bot_name=${bot_name}`);
   if (Array.isArray(extra)) for (const kv of extra) args.push(String(kv));
-
 
   const recordingsDir = process.env.RECORDINGS_DIR || path.join(path.dirname(runPath), "recordings");
   setJob(id, {
@@ -493,36 +597,79 @@ app.post("/jobs", async (req, res) => {
   return res.json({ success: true, jobId: id, pid: child.pid, status: "running" });
 });
 
-// Job status
-app.get("/jobs/:id/status", (req, res) => {
-  const j = JOBS.get(req.params.id);
-  if (!j) return res.status(404).json({ success: false, error: "job_not_found" });
-  const { id, pid, status, createdAt, updatedAt, startedAt, meeting_url, bot_name, uuid, containerName, recordings, exitCode, signal, error } = j;
-  res.json({ success: true, id, pid, status, createdAt, updatedAt, startedAt, meeting_url, bot_name, uuid, containerName, recordings, exitCode, signal, error });
-});
+// Job status (augment with queue info if present)
+app.get("/jobs/:id/status", async (req, res) => {
+  const id = req.params.id;
 
-// ---- helper: stop by container name / label(uuid) (FORCE only) ----
-function stopByContainerNameOrUuid(job) {
-  // 1) มีชื่อชัดเจน
-  if (job.containerName) {
-    try {
-      execSync(`docker stop ${job.containerName}`, { stdio: "inherit" });
-      return { via: "docker_stop_name", target: job.containerName };
-    } catch (e) {}
+  // 1) หา runtime job (ของบอทที่ spawn ไปแล้ว)
+  const j = JOBS.get(id);
+
+  // 2) หา queue job (กรณี id นี้คือ job ของ BullMQ ที่ยังรันไม่ถึง หรือเพิ่งจบไป)
+  let qJob = null;
+  try {
+    qJob = await schedQueue.getJob(id);
+  } catch (_) {}
+
+  // กรณีไม่มี runtime job แต่มีคิว → ตอบสถานะคิวให้เลย (รองรับการใช้ endpoint นี้ด้วย job_id ของ schedule/delay)
+  if (!j && qJob) {
+    const view = await serializeJob(qJob);
+    return res.json({
+      success: true,
+      id,
+      // โชว์สถานะคิว
+      queued: view.queued,
+      queue_state: view.state,            // delayed|waiting|active|completed|failed
+      next_run_at: view.next_run_at,      // ISO เวลาที่คิวจะยิง
+      // เผื่อดีบั๊ก: ถ้าคิวทำงานเสร็จแล้ว returnvalue จะมี jobId ของ runtime ที่ถูกยิง
+      launched_job_id: view?.returnvalue?.jobId || null,
+      // คงไว้เป็นโครงสร้างย่อย
+      queue: view
+    });
   }
-  // 2) หาโดย label meetbot.uuid=<uuid>
-  if (job.uuid) {
-    try {
-      const out = execSync(`docker ps --filter "label=meetbot.uuid=${job.uuid}" --format "{{.ID}}"`).toString().trim();
-      const id = out.split("\n").filter(Boolean)[0];
-      if (id) {
-        execSync(`docker stop ${id}`, { stdio: "inherit" });
-        return { via: "docker_stop_label", target: id };
-      }
-    } catch (e) {}
+
+  // ไม่มีทั้ง runtime job และ queue job → เหมือนเดิม: 404
+  if (!j) {
+    return res.status(404).json({ success: false, error: "job_not_found" });
   }
-  throw new Error("no_container_target");
-}
+
+  // มี runtime job → ตอบรูปแบบเดิมก่อน
+  const {
+    pid, status, createdAt, updatedAt, startedAt, meeting_url, bot_name,
+    uuid, containerName, recordings, exitCode, signal, error
+  } = j;
+
+  const response = {
+    success: true,
+    id,
+    pid,
+    status,
+    createdAt,
+    updatedAt,
+    startedAt,
+    meeting_url,
+    bot_name,
+    uuid,
+    containerName,
+    recordings,
+    exitCode,
+    signal,
+    error
+  };
+
+  // ถ้ามีคิวที่อ้างอิง id เดียวกันด้วย (เคสยิงดูสถานะตอนยังรันไม่ถึง หรือคิวเพิ่งจบ)
+  if (qJob) {
+    const view = await serializeJob(qJob);
+    response.queued = view.queued;
+    response.queue_state = view.state;
+    response.next_run_at = view.next_run_at;
+    response.launched_job_id = view?.returnvalue?.jobId || null;
+    response.queue = view; // เก็บรายละเอียดไว้ใน field 'queue'
+  } else {
+    response.queued = false;
+  }
+
+  res.json(response);
+});
 
 app.post("/jobs/:id/stop", async (req, res) => {
   const jobId = req.params.id;
@@ -653,6 +800,122 @@ app.get("/s3/presign-get", async (req, res) => {
       error: "presign_failed",
       detail: e?.message || String(e),
     });
+  }
+});
+
+app.post("/jobs/delay", async (req, res) => {
+  const { meeting_url, bot_name, extra, after, delay_ms, idempotency_key, retry } = req.body || {};
+  if (!meeting_url) return res.status(400).json({ success: false, error: "meeting_url required" });
+
+  let ms = Number.isFinite(Number(delay_ms)) ? Number(delay_ms) : parseAfterToMs(after);
+  if (!Number.isFinite(ms)) return res.status(400).json({ success: false, error: "provide after (e.g. '10m') or delay_ms" });
+  ms = Math.max(0, Math.min(ms, 90 * 24 * 60 * 60_000)); // ≤ 90 วัน
+
+  const jobId = idempotency_key || crypto.randomUUID();
+
+  /** @type {import('bullmq').JobsOptions} */
+  const opts = {
+    jobId,
+    delay: ms,
+    attempts: retry?.max ?? 0,
+    backoff: retry?.backoff_ms ? { type: "fixed", delay: retry.backoff_ms } : undefined,
+    removeOnComplete: { age: 24 * 3600, count: 1000 },
+    removeOnFail: false
+  };
+
+  let job;
+  try {
+    job = await schedQueue.add("launch-once", { meeting_url, bot_name, extra }, opts);
+  } catch (e) {
+    // ถ้า id ซ้ำ (idempotent) → ดึงของเดิมมาส่งคืน
+    const existing = await schedQueue.getJob(jobId);
+    if (existing) {
+      const view = await serializeJob(existing);
+      return res.status(200).json({ success: true, job_id: existing.id, status: "queued", next_run_at: view.next_run_at, type: "delay" });
+    }
+    throw e;
+  }
+
+  const nextRunAt = new Date(Date.now() + ms).toISOString();
+  res.status(201).json({
+    success: true,
+    job_id: job.id,
+    status: "queued",
+    next_run_at: nextRunAt,
+    type: "delay"
+  });
+});
+
+
+// สร้างงานแบบ "นัดวัน-เวลา ISO"
+app.post("/jobs/schedule", async (req, res) => {
+  const { at, meeting_url, bot_name, extra, idempotency_key, retry } = req.body || {};
+  if (!at) return res.status(400).json({ success: false, error: "at required (ISO 8601)" });
+  if (!meeting_url) return res.status(400).json({ success: false, error: "meeting_url required" });
+
+  const atMs = Number(new Date(at));
+  if (!Number.isFinite(atMs)) return res.status(400).json({ success: false, error: "invalid at: not a valid date" });
+  const delay = Math.max(0, atMs - Date.now());
+
+  const jobId = idempotency_key || crypto.randomUUID();
+
+  /** @type {import('bullmq').JobsOptions} */
+  const opts = {
+    jobId,
+    delay,
+    attempts: retry?.max ?? 0,
+    backoff: retry?.backoff_ms ? { type: "fixed", delay: retry.backoff_ms } : undefined,
+    removeOnComplete: { age: 24 * 3600, count: 1000 },
+    removeOnFail: false
+  };
+
+  let job;
+  try {
+    job = await schedQueue.add("launch-once", { meeting_url, bot_name, extra }, opts);
+  } catch (e) {
+    const existing = await schedQueue.getJob(jobId);
+    if (existing) {
+      const view = await serializeJob(existing);
+      return res.status(200).json({ success: true, job_id: existing.id, status: "queued", next_run_at: view.next_run_at, type: "once" });
+    }
+    throw e;
+  }
+
+  res.status(201).json({
+    success: true,
+    job_id: job.id,
+    status: "queued",
+    next_run_at: new Date(atMs).toISOString(),
+    type: "once"
+  });
+});
+
+
+// ดูสถานะงาน
+app.get("/jobs/schedule/:id", async (req, res) => {
+  const job = await schedQueue.getJob(req.params.id);
+  if (!job) return res.status(404).json({ success: false, error: "job_not_found" });
+  const view = await serializeJob(job);
+  res.json({ success: true, job: view });
+});
+
+// ลิสต์งาน (รวม next_run_at)
+app.get("/jobs/schedule", async (_req, res) => {
+  const jobs = await schedQueue.getJobs(["delayed","waiting","active","completed","failed"], 0, 100);
+  const items = [];
+  for (const j of jobs) items.push(await serializeJob(j));
+  res.json({ success: true, count: items.length, items });
+});
+
+// ยกเลิก (ลบงานออกจากคิว; ถ้าเริ่มทำงานไปแล้วจะลบไม่ได้)
+app.delete("/jobs/schedule/:id", async (req, res) => {
+  const job = await schedQueue.getJob(req.params.id);
+  if (!job) return res.status(404).json({ success: false, error: "job_not_found" });
+  try {
+    await job.remove();
+    res.json({ success: true, job_id: job.id, removed: true });
+  } catch (e) {
+    res.status(409).json({ success: false, error: "cannot_remove", detail: e?.message || String(e) });
   }
 });
 
