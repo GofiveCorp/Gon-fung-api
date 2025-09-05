@@ -848,7 +848,7 @@ app.post("/jobs/delay", async (req, res) => {
 
 
 // สร้างงานแบบ "นัดวัน-เวลา ISO"
-app.post("/jobs/schedule", async (req, res) => {
+app.post("/jobs/booking", async (req, res) => {
   const { at, meeting_url, bot_name, extra, idempotency_key, retry } = req.body || {};
   if (!at) return res.status(400).json({ success: false, error: "at required (ISO 8601)" });
   if (!meeting_url) return res.status(400).json({ success: false, error: "meeting_url required" });
@@ -886,7 +886,7 @@ app.post("/jobs/schedule", async (req, res) => {
     job_id: job.id,
     status: "queued",
     next_run_at: new Date(atMs).toISOString(),
-    type: "once"
+    type: "booking"
   });
 });
 
